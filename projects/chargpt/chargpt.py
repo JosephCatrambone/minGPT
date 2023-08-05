@@ -29,7 +29,8 @@ def get_config():
 
     # model
     C.model = GPT.get_default_config()
-    C.model.model_type = 'gpt-mini'
+    #C.model.model_type = 'gpt-mini'
+    C.model.model_type = 'gpt2-medium'
 
     # trainer
     C.trainer = Trainer.get_default_config()
@@ -87,13 +88,13 @@ if __name__ == '__main__':
 
     # get default config and overrides from the command line, if any
     config = get_config()
-    config.merge_from_args(sys.argv[1:])
+    config.merge_from_args(sys.argv[2:])
     print(config)
     setup_logging(config)
     set_seed(config.system.seed)
 
     # construct the training dataset
-    text = open('input.txt', 'r').read() # don't worry we won't run out of file handles
+    text = open(sys.argv[1], 'r').read() # don't worry we won't run out of file handles
     train_dataset = CharDataset(config.data, text)
 
     # construct the model
@@ -115,7 +116,7 @@ if __name__ == '__main__':
             model.eval()
             with torch.no_grad():
                 # sample from the model...
-                context = "O God, O God!"
+                context = "In a surprising twist,"
                 x = torch.tensor([train_dataset.stoi[s] for s in context], dtype=torch.long)[None,...].to(trainer.device)
                 y = model.generate(x, 500, temperature=1.0, do_sample=True, top_k=10)[0]
                 completion = ''.join([train_dataset.itos[int(i)] for i in y])

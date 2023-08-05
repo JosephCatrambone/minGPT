@@ -26,6 +26,231 @@ class NewGELU(nn.Module):
     def forward(self, x):
         return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
+
+class MixedMemorySelfAttention(nn.Module):
+    """
+    Spinning off of Andrej Karpathy's well written attention module, this takes different configs in the forward pass.
+    It adds another step which can attend to an earlier state.
+    """
+
+    def __init__(self, embedding_dims: int, attention_heads: int, attention_dropout: float, residual_dropout: float, block_size: int):
+        super().__init__()
+        assert embedding_dims % attention_heads == 0
+        # Single-pass key, query, value projections for all heads
+        self.c_attn = nn.Linear(embedding_dims, 3 * embedding_dims)
+        self.c_proj = nn.Linear(embedding_dims, embedding_dims)
+        # Regularization
+        self.attn_dropout = nn.Dropout(attention_dropout)
+        self.resid_dropout = nn.Dropout(residual_dropout)
+        # Causal mask to ensure that attention is only applied to the left in the input sequence
+        # This preallocates a lower triangular matrix of size [block, block]
+        self.register_buffer(
+            "bias",
+            torch.tril(
+                torch.ones(block_size, block_size)
+            ).view(1, 1, block_size, block_size))
+        self.n_head = attention_heads
+        self.n_embd = embedding_dims
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+class MixedMemoryBlock(nn.Module):
+    """ An unrolled (parameter-expanded) Transformer block. """
+
+    def __init__(self, activation_fn_cls, embedding_dims: int, attention_heads: int, attention_dropout: float, residual_dropout: float, block_size: int):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(embedding_dims)
+        self.attn = MixedMemorySelfAttention(embedding_dims, attention_heads, attention_dropout, residual_dropout, block_size)
+        self.ln_2 = nn.LayerNorm(embedding_dims)
+        self.c_fc = nn.Linear(embedding_dims, 4 * embedding_dims)
+        self.c_proj = nn.Linear(4 * embedding_dims, embedding_dims)
+        self.act = activation_fn_cls()
+        self.dropout = nn.Dropout(residual_dropout)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.dropout(self.c_proj(self.act(self.c_fc(self.ln_2(x)))))
+        return x
+
+
+class ConvSTM(nn.Module):
+    """Convolutional Short-Term-Memory Network."""
+    def __init__(
+            self,
+            num_layers: int = 24,
+            num_heads: int = 24,
+            embedding_dims: int = 512,
+            block_length: int = 2048,
+            embedding_dropout: float = 0.1,
+            attention_dropout: float = 0.1,
+            residual_dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.activation_fn_cls = nn.SELU
+        self.activation = self.activation_fn_cls()
+        # This provides the pseudo-word-embedding, but not the positional embedding
+        self.text_conv = nn.Conv1d(in_channels=256, out_channels=embedding_dims, kernel_size=4)
+        self.reduction = nn.MaxPool1d(kernel_size=4)
+        self.dropout = nn.Dropout(embedding_dropout)
+        # Missing: Layer norm(n_embed).
+
+        self.blocks = nn.ModuleList(
+            MixedMemoryBlock(
+                self.activation_fn_cls,
+                embedding_dims,
+                num_heads,
+                attention_dropout,
+                residual_dropout,
+                block_length
+            ) for _ in range(num_layers)
+        )
+
+        self.lm_head = nn.Linear(embedding_dims, 256, bias=False)
+
+        # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * num_layers))
+
+        # report number of parameters (note we don't count the decoder parameters in lm_head)
+        n_params = sum(p.numel() for p in self.blocks.parameters())
+        print("number of parameters: %.2fM" % (n_params / 1e6,))
+
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+
+    def configure_optimizers(self, train_config):
+        """
+        This long function is unfortunately doing something very simple and is being very defensive:
+        We are separating out all parameters of the model into two buckets: those that will experience
+        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
+        We are then returning the PyTorch optimizer object.
+        """
+
+        # separate out all parameters to those that will and won't experience regularizing weight decay
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear,)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = '%s.%s' % (mn, pn) if mn else pn  # full param name
+                # random note: because named_modules and named_parameters are recursive
+                # we will see the same tensors p many many times. but doing it this way
+                # allows us to know which parent module any tensor p belongs to...
+                if pn.endswith('bias'):
+                    # all biases will not be decayed
+                    no_decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
+                    # weights of whitelist modules will be weight decayed
+                    decay.add(fpn)
+                elif pn.endswith('weight') and isinstance(m, blacklist_weight_modules):
+                    # weights of blacklist modules will NOT be weight decayed
+                    no_decay.add(fpn)
+
+        # validate that we considered every parameter
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
+        assert len(
+            param_dict.keys() - union_params) == 0, "parameters %s were not separated into either decay/no_decay set!" \
+                                                    % (str(param_dict.keys() - union_params),)
+
+        # create the pytorch optimizer object
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(list(decay))], "weight_decay": train_config.weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(list(no_decay))], "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
+        return optimizer
+
+    def forward(self, idx, targets=None):
+        # idx is a 2D array of size [batch_size, block_size], but they're longs (chars).
+        device = idx.device
+        batch_size, idx_block_length = idx.size()
+        assert idx_block_length <= self.block_size, f"Cannot forward sequence of length {idx_block_length}, block size is only {self.block_size}"
+
+        # Generate positional encoding for the example:
+        pos = torch.arange(0, idx_block_length, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, idx_block_size)
+
+        # forward the GPT model itself
+        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        # if we are given some desired targets also calculate the loss
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self(idx_cond)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # either sample from the distribution or take the most likely element
+            if do_sample:
+                idx_next = torch.multinomial(probs, num_samples=1)
+            else:
+                _, idx_next = torch.topk(probs, k=1, dim=-1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
+
 class CausalSelfAttention(nn.Module):
     """
     A vanilla multi-head masked self-attention layer with a projection at the end.
@@ -70,6 +295,7 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+
 class Block(nn.Module):
     """ an unassuming Transformer block """
 
@@ -91,6 +317,35 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlpf(self.ln_2(x))
         return x
+
+
+class Head(nn.Module):
+    """ one head of self-attention """
+
+    def __init__(self, head_size, n_embd, dropout, block_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B,T,C = x.shape
+        k = self.key(x)   # (B,T,C)
+        q = self.query(x) # (B,T,C)
+        # compute attention scores ("affinities")
+        # sqrt(C) rather than sqrt(n_heads) because in the paper normalization is done with sqrt(dk) which in our case is C.
+        wei = q @ k.transpose(-2,-1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
+        # perform the weighted aggregation of the values
+        v = self.value(x) # (B,T,C)
+        out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
+        return out
+
 
 class GPT(nn.Module):
     """ GPT Language Model """
