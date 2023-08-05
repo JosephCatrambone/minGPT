@@ -98,7 +98,7 @@ class ConvSTM(nn.Module):
     def __init__(
             self,
             num_layers: int = 24,
-            num_heads: int = 24,
+            num_heads: int = 8,
             embedding_dims: int = 512,
             block_length: int = 2048,
             embedding_dropout: float = 0.1,
@@ -106,11 +106,13 @@ class ConvSTM(nn.Module):
             residual_dropout: float = 0.1,
     ):
         super().__init__()
+        self.block_length = block_length
         self.activation_fn_cls = nn.SELU
         self.activation = self.activation_fn_cls()
         # This provides the pseudo-word-embedding, but not the positional embedding
         self.text_conv = nn.Conv1d(in_channels=256, out_channels=embedding_dims, kernel_size=4)
         self.reduction = nn.MaxPool1d(kernel_size=4)
+        self.pos_embedding = nn.Embedding(num_embeddings=block_length, embedding_dim=embedding_dims)
         self.dropout = nn.Dropout(embedding_dropout)
         # Missing: Layer norm(n_embed).
 
@@ -136,7 +138,6 @@ class ConvSTM(nn.Module):
         # report number of parameters (note we don't count the decoder parameters in lm_head)
         n_params = sum(p.numel() for p in self.blocks.parameters())
         print("number of parameters: %.2fM" % (n_params / 1e6,))
-
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -168,8 +169,8 @@ class ConvSTM(nn.Module):
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way
                 # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith('bias'):
-                    # all biases will not be decayed
+                if pn.endswith('bias') or 'text_conv' in pn:
+                    # all biases will not be decayed, nor will the text embedding.
                     no_decay.add(fpn)
                 elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
                     # weights of whitelist modules will be weight decayed
@@ -199,18 +200,25 @@ class ConvSTM(nn.Module):
         # idx is a 2D array of size [batch_size, block_size], but they're longs (chars).
         device = idx.device
         batch_size, idx_block_length = idx.size()
-        assert idx_block_length <= self.block_size, f"Cannot forward sequence of length {idx_block_length}, block size is only {self.block_size}"
-
-        # Generate positional encoding for the example:
-        pos = torch.arange(0, idx_block_length, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, idx_block_size)
+        assert idx_block_length <= self.block_length, f"Cannot forward sequence of length {idx_block_length}, block size is only {self.block_length}"
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos)  # position embeddings of shape (1, t, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
+        embeddings = nn.functional.one_hot(idx, num_classes=256).transpose(1, 2) * 1.0  # Output pre transposition: (batch_size, idx_block_size, n_embed_dims), after: batch, dims, block
+        # Multiply by 1.0 to hack an autocast to float or double or whatever.
+        # Both the reduction (maxpool) and conv expect [batch_size, channels, length] but we have [batch, length, channels]
+        tok_conv = self.text_conv(embeddings)
+        print(tok_conv.shape)
+        tok_emb = self.reduction(tok_conv)  # token embeddings of shape (batch_size, n_embd, idx_block_size - pad)
+        print(tok_emb.shape)
+
+        # Generate positional encoding for the example:
+        pos = torch.arange(0, pos_emb.size(), dtype=torch.long, device=device).unsqueeze(0)  # shape (1, idx_block_size)
+        pos_emb = self.pos_embedding(pos)  # position embeddings of shape (1, idx_block_size, n_embd)
+        print(pos_emb.shape)
+        x = self.dropout(tok_emb.transpose(1, 2) + pos_emb)
+        for block in self.blocks:
             x = block(x)
-        x = self.transformer.ln_f(x)
+        #x = self.transformer.ln_f(x) # Normalization removed!
         logits = self.lm_head(x)
 
         # if we are given some desired targets also calculate the loss
@@ -229,7 +237,7 @@ class ConvSTM(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
+            idx_cond = idx if idx.size(1) <= self.block_length else idx[:, -self.block_length:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
