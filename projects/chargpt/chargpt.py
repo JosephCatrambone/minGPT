@@ -4,16 +4,18 @@ Trains a character-level language model.
 
 import os
 import sys
+from typing import BinaryIO
 
 import torch
 from torch.utils.data import Dataset
 from torch.utils.data.dataloader import DataLoader
 
-from mingpt.model import GPT, ConvSTM
+from mingpt.model import GPT, C2GPT
 from mingpt.trainer import Trainer
 from mingpt.utils import set_seed, setup_logging, CfgNode as CN
 
 # -----------------------------------------------------------------------------
+
 
 def get_config():
 
@@ -39,6 +41,7 @@ def get_config():
     return C
 
 # -----------------------------------------------------------------------------
+
 
 class CharDataset(Dataset):
     """
@@ -82,10 +85,46 @@ class CharDataset(Dataset):
         y = torch.tensor(dix[1:], dtype=torch.long)
         return x, y
 
+
+class ByteStreamDataset(Dataset):
+    """
+    Emits batches of bytes.
+    """
+    def __init__(self, file_handle: BinaryIO, sequence_length: int):
+        self.file_handle = file_handle
+        self.sequence_length = sequence_length
+        self.input_length = 0
+        file_handle.seek(0, 2)  # Seek to EOF.
+        self.input_length = file_handle.tell()
+        assert file_handle.mode == 'rb'
+
+    @staticmethod
+    def get_vocab_size():
+        return 256
+
+    def get_block_size(self):
+        return self.sequence_length
+
+    def __len__(self):
+        return self.input_length - self.get_block_size() - 1
+
+    def __getitem__(self, idx):
+        self.file_handle.seek(idx, 0)
+        # Grab a chunk of (block_size + 1) characters from the data
+        #chunk = self.data[idx:idx + self.config.block_size + 1]
+        chunk = self.file_handle.read(self.get_block_size() + 1)
+        # Chunk is already a byte array so we need to do no conversion.
+        x = torch.tensor([c for c in chunk[:-1]], dtype=torch.long)
+        y = torch.tensor([c for c in chunk[1:]], dtype=torch.long)
+        return x, y
+
+
+
+
+
 # -----------------------------------------------------------------------------
 
 if __name__ == '__main__':
-
     # get default config and overrides from the command line, if any
     config = get_config()
     config.merge_from_args(sys.argv[2:])
@@ -93,15 +132,23 @@ if __name__ == '__main__':
     setup_logging(config)
     set_seed(config.system.seed)
 
+    sequence_length = 1024
+
     # construct the training dataset
-    text = open(sys.argv[1], 'r').read() # don't worry we won't run out of file handles
-    train_dataset = CharDataset(config.data, text)
+    tin = open(sys.argv[1], 'rb')
+    train_dataset = ByteStreamDataset(tin, sequence_length=sequence_length)
 
     # construct the model
     config.model.vocab_size = train_dataset.get_vocab_size()
-    config.model.block_size = train_dataset.get_block_size()
+    config.model.block_size = sequence_length // 4
     #model = GPT(config.model)
-    model = ConvSTM()
+    model = C2GPT(
+        input_sequence_length=sequence_length,
+        ngram_embedding_size=512,
+        ngram_length=4,
+        num_layers=8,
+        num_heads=8,
+    )
 
     # construct the trainer object
     trainer = Trainer(config.trainer, model, train_dataset)
@@ -117,10 +164,13 @@ if __name__ == '__main__':
             model.eval()
             with torch.no_grad():
                 # sample from the model...
-                context = "In a surprising twist,"
-                x = torch.tensor([train_dataset.stoi[s] for s in context], dtype=torch.long)[None,...].to(trainer.device)
+                context = b"In a surprising twist,"
+                x = torch.tensor(context, dtype=torch.long)[None, ...].to(trainer.device)
                 y = model.generate(x, 500, temperature=1.0, do_sample=True, top_k=10)[0]
-                completion = ''.join([train_dataset.itos[int(i)] for i in y])
+                completion_bytes = list()
+                for i in y:
+                    completion_bytes.append(i)
+                completion = bytes(completion_bytes).decode('utf-8', errors='ignore')
                 print(completion)
             # save the latest model
             print("saving model")

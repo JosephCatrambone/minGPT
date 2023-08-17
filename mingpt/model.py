@@ -54,6 +54,7 @@ class MixedMemorySelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        print(f"B: {B}, T: {T}, C: {C}")
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -63,6 +64,8 @@ class MixedMemorySelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        print(f"att.shape: {att.shape}")
+        print(f"self.bias.shape: {self.bias.shape}")
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
@@ -80,7 +83,13 @@ class MixedMemoryBlock(nn.Module):
     def __init__(self, activation_fn_cls, embedding_dims: int, attention_heads: int, attention_dropout: float, residual_dropout: float, block_size: int):
         super().__init__()
         self.ln_1 = nn.LayerNorm(embedding_dims)
-        self.attn = MixedMemorySelfAttention(embedding_dims, attention_heads, attention_dropout, residual_dropout, block_size)
+        self.attn = MixedMemorySelfAttention(
+            embedding_dims=embedding_dims,
+            attention_heads=attention_heads,
+            attention_dropout=attention_dropout,
+            residual_dropout=residual_dropout,
+            block_size=block_size
+        )
         self.ln_2 = nn.LayerNorm(embedding_dims)
         self.c_fc = nn.Linear(embedding_dims, 4 * embedding_dims)
         self.c_proj = nn.Linear(4 * embedding_dims, embedding_dims)
@@ -93,41 +102,51 @@ class MixedMemoryBlock(nn.Module):
         return x
 
 
-class ConvSTM(nn.Module):
-    """Convolutional Short-Term-Memory Network."""
+class C2GPT(nn.Module):
+    """Convolutional-Convolutional Generative Pre-trained Transformer."""
     def __init__(
             self,
+            input_sequence_length: int = 4096,
+            ngram_length: int = 4,
+            ngram_embedding_size: int = 512,
             num_layers: int = 24,
             num_heads: int = 8,
-            embedding_dims: int = 512,
-            block_length: int = 2048,
             embedding_dropout: float = 0.1,
             attention_dropout: float = 0.1,
             residual_dropout: float = 0.1,
     ):
         super().__init__()
-        self.block_length = block_length
+        self.input_size = input_sequence_length
+        self.kernel_size = ngram_length
+        self.ngram_embedding_size = ngram_embedding_size
+        #
         self.activation_fn_cls = nn.SELU
         self.activation = self.activation_fn_cls()
         # This provides the pseudo-word-embedding, but not the positional embedding
-        self.text_conv = nn.Conv1d(in_channels=256, out_channels=embedding_dims, kernel_size=4)
-        self.reduction = nn.MaxPool1d(kernel_size=4)
-        self.pos_embedding = nn.Embedding(num_embeddings=block_length, embedding_dim=embedding_dims)
+        self.text_conv = nn.Conv1d(in_channels=256, out_channels=self.ngram_embedding_size, kernel_size=self.kernel_size, padding='same')
+        self.text_deconv = nn.ConvTranspose1d(in_channels=self.ngram_embedding_size, out_channels=256, stride=self.kernel_size, kernel_size=self.kernel_size)
+        self.pos_embedding = nn.Embedding(num_embeddings=self.input_size//self.kernel_size, embedding_dim=self.ngram_embedding_size)
         self.dropout = nn.Dropout(embedding_dropout)
         # Missing: Layer norm(n_embed).
 
         self.blocks = nn.ModuleList(
+            # In: batch_size, seq len, embed dim (n_embed)
+            # In: batch_size, input_length/(input_length/embedding_dims), embedding_dims
+            # batch size, sequence length, embedding dimensionality (n_embd)
             MixedMemoryBlock(
-                self.activation_fn_cls,
-                embedding_dims,
-                num_heads,
-                attention_dropout,
-                residual_dropout,
-                block_length
+                activation_fn_cls=self.activation_fn_cls,
+                embedding_dims=self.ngram_embedding_size,
+                attention_heads=num_heads,
+                attention_dropout=attention_dropout,
+                residual_dropout=residual_dropout,
+                block_size=self.input_size // self.kernel_size
             ) for _ in range(num_layers)
         )
+        # If we keep the intermediates, we end up with  [num_layers, batch_size, seq_len, embed_dim]
+        #
+        #self.final_conv = nn.Conv2d(in_channels=)
 
-        self.lm_head = nn.Linear(embedding_dims, 256, bias=False)
+        self.lm_head = nn.Linear(self.ngram_embedding_size, 256, bias=False)
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
@@ -169,7 +188,7 @@ class ConvSTM(nn.Module):
                 # random note: because named_modules and named_parameters are recursive
                 # we will see the same tensors p many many times. but doing it this way
                 # allows us to know which parent module any tensor p belongs to...
-                if pn.endswith('bias') or 'text_conv' in pn:
+                if pn.endswith('bias') or 'text_conv' in pn or 'text_deconv' in pn:
                     # all biases will not be decayed, nor will the text embedding.
                     no_decay.add(fpn)
                 elif pn.endswith('weight') and isinstance(m, whitelist_weight_modules):
@@ -197,29 +216,31 @@ class ConvSTM(nn.Module):
         return optimizer
 
     def forward(self, idx, targets=None):
-        # idx is a 2D array of size [batch_size, block_size], but they're longs (chars).
+        # idx is a 2D array of size [batch_size, seq_len (block_size * kernel_size)], but they're longs (chars).
         device = idx.device
         batch_size, idx_block_length = idx.size()
-        assert idx_block_length <= self.block_length, f"Cannot forward sequence of length {idx_block_length}, block size is only {self.block_length}"
+        assert idx_block_length <= self.input_size, f"Cannot forward sequence of length {idx_block_length}, block size is only {self.block_length}"
 
         # forward the GPT model itself
-        embeddings = nn.functional.one_hot(idx, num_classes=256).transpose(1, 2) * 1.0  # Output pre transposition: (batch_size, idx_block_size, n_embed_dims), after: batch, dims, block
+        embeddings = nn.functional.one_hot(idx, num_classes=256).transpose(1, 2) * 1.0  # Output pre transposition: (batch_size, idx_block_size, n_embed_dims), after: batch, dims, len/block
         # Multiply by 1.0 to hack an autocast to float or double or whatever.
         # Both the reduction (maxpool) and conv expect [batch_size, channels, length] but we have [batch, length, channels]
-        tok_conv = self.text_conv(embeddings)
-        print(tok_conv.shape)
-        tok_emb = self.reduction(tok_conv)  # token embeddings of shape (batch_size, n_embd, idx_block_size - pad)
-        print(tok_emb.shape)
+        tok_conv = self.text_conv(embeddings).transpose(1, 2)  # Transpose for [b, len, channels]
+        print(f"tok_emb shape: {tok_conv.shape}")
 
         # Generate positional encoding for the example:
-        pos = torch.arange(0, pos_emb.size(), dtype=torch.long, device=device).unsqueeze(0)  # shape (1, idx_block_size)
+        pos = torch.arange(0, tok_conv.size(1), dtype=torch.long, device=device).unsqueeze(0)  # shape (1, idx_block_size)
         pos_emb = self.pos_embedding(pos)  # position embeddings of shape (1, idx_block_size, n_embd)
-        print(pos_emb.shape)
-        x = self.dropout(tok_emb.transpose(1, 2) + pos_emb)
+        print(f"pos_emb shape: {pos_emb.shape}")
+        x = self.dropout(tok_conv + pos_emb)
         for block in self.blocks:
+            print(f"x shape: {x.shape}")
             x = block(x)
         #x = self.transformer.ln_f(x) # Normalization removed!
-        logits = self.lm_head(x)
+        lm_out = self.lm_head(x)
+        print(f"lm out shape: {lm_out.shape}")
+        logits = self.text_deconv(lm_out.transpose(1, 2)).transpose(1, 2)
+        print(logits.shape)
 
         # if we are given some desired targets also calculate the loss
         loss = None
