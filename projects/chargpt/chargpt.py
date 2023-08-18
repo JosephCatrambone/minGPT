@@ -4,6 +4,7 @@ Trains a character-level language model.
 
 import os
 import sys
+import time
 from typing import BinaryIO
 
 import torch
@@ -36,7 +37,7 @@ def get_config():
 
     # trainer
     C.trainer = Trainer.get_default_config()
-    C.trainer.learning_rate = 5e-4 # the model we're using is so small that we can go a bit faster
+    C.trainer.learning_rate = 5e-6 # the model we're using is so small that we can go a bit faster
 
     return C
 
@@ -119,9 +120,6 @@ class ByteStreamDataset(Dataset):
         return x, y
 
 
-
-
-
 # -----------------------------------------------------------------------------
 
 if __name__ == '__main__':
@@ -132,26 +130,22 @@ if __name__ == '__main__':
     setup_logging(config)
     set_seed(config.system.seed)
 
-    sequence_length = 1024
+    sequence_length = 512
 
     # construct the training dataset
     tin = open(sys.argv[1], 'rb')
     train_dataset = ByteStreamDataset(tin, sequence_length=sequence_length)
 
     # construct the model
-    config.model.vocab_size = train_dataset.get_vocab_size()
-    config.model.block_size = sequence_length // 4
-    #model = GPT(config.model)
     model = C2GPT(
         input_sequence_length=sequence_length,
-        ngram_embedding_size=512,
-        ngram_length=4,
-        num_layers=8,
-        num_heads=8,
+        num_layers=64,
+        num_heads=32,
     )
 
     # construct the trainer object
     trainer = Trainer(config.trainer, model, train_dataset)
+    record = open(f"training_record_{int(time.time())}.txt", 'wt')
 
     # iteration callback
     def batch_end_callback(trainer):
@@ -159,19 +153,21 @@ if __name__ == '__main__':
         if trainer.iter_num % 10 == 0:
             print(f"iter_dt {trainer.iter_dt * 1000:.2f}ms; iter {trainer.iter_num}: train loss {trainer.loss.item():.5f}")
 
-        if trainer.iter_num % 500 == 0:
+        if trainer.iter_num % 100 == 0:
             # evaluate both the train and test score
             model.eval()
             with torch.no_grad():
                 # sample from the model...
                 context = b"In a surprising twist,"
-                x = torch.tensor(context, dtype=torch.long)[None, ...].to(trainer.device)
+                x = torch.tensor([b for b in context], dtype=torch.long)[None, ...].to(trainer.device)
                 y = model.generate(x, 500, temperature=1.0, do_sample=True, top_k=10)[0]
                 completion_bytes = list()
                 for i in y:
                     completion_bytes.append(i)
                 completion = bytes(completion_bytes).decode('utf-8', errors='ignore')
                 print(completion)
+                record.write(f"iter {trainer.iter_num} - loss {trainer.loss.item():.8f} - '{context}{completion}'\n")
+                record.flush()
             # save the latest model
             print("saving model")
             ckpt_path = os.path.join(config.system.work_dir, "model.pt")

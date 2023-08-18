@@ -33,7 +33,7 @@ class MixedMemorySelfAttention(nn.Module):
     It adds another step which can attend to an earlier state.
     """
 
-    def __init__(self, embedding_dims: int, attention_heads: int, attention_dropout: float, residual_dropout: float, block_size: int):
+    def __init__(self, sequence_length: int, embedding_dims: int, attention_heads: int, attention_dropout: float, residual_dropout: float):
         super().__init__()
         assert embedding_dims % attention_heads == 0
         # Single-pass key, query, value projections for all heads
@@ -47,14 +47,13 @@ class MixedMemorySelfAttention(nn.Module):
         self.register_buffer(
             "bias",
             torch.tril(
-                torch.ones(block_size, block_size)
-            ).view(1, 1, block_size, block_size))
+                torch.ones(sequence_length, sequence_length)
+            ).view(1, 1, sequence_length, sequence_length))
         self.n_head = attention_heads
         self.n_embd = embedding_dims
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-        print(f"B: {B}, T: {T}, C: {C}")
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -64,8 +63,6 @@ class MixedMemorySelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        print(f"att.shape: {att.shape}")
-        print(f"self.bias.shape: {self.bias.shape}")
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
@@ -80,15 +77,15 @@ class MixedMemorySelfAttention(nn.Module):
 class MixedMemoryBlock(nn.Module):
     """ An unrolled (parameter-expanded) Transformer block. """
 
-    def __init__(self, activation_fn_cls, embedding_dims: int, attention_heads: int, attention_dropout: float, residual_dropout: float, block_size: int):
+    def __init__(self, activation_fn_cls, sequence_length:int, embedding_dims: int, attention_heads: int, attention_dropout: float, residual_dropout: float):
         super().__init__()
         self.ln_1 = nn.LayerNorm(embedding_dims)
         self.attn = MixedMemorySelfAttention(
+            sequence_length=sequence_length,
             embedding_dims=embedding_dims,
             attention_heads=attention_heads,
             attention_dropout=attention_dropout,
             residual_dropout=residual_dropout,
-            block_size=block_size
         )
         self.ln_2 = nn.LayerNorm(embedding_dims)
         self.c_fc = nn.Linear(embedding_dims, 4 * embedding_dims)
@@ -103,12 +100,10 @@ class MixedMemoryBlock(nn.Module):
 
 
 class C2GPT(nn.Module):
-    """Convolutional-Convolutional Generative Pre-trained Transformer."""
+    """Crappy Character Generative Pre-trained Transformer."""
     def __init__(
             self,
             input_sequence_length: int = 4096,
-            ngram_length: int = 4,
-            ngram_embedding_size: int = 512,
             num_layers: int = 24,
             num_heads: int = 8,
             embedding_dropout: float = 0.1,
@@ -117,16 +112,14 @@ class C2GPT(nn.Module):
     ):
         super().__init__()
         self.input_size = input_sequence_length
-        self.kernel_size = ngram_length
-        self.ngram_embedding_size = ngram_embedding_size
+        self.embed_size = 256  # Same as char size.
         #
         self.activation_fn_cls = nn.SELU
         self.activation = self.activation_fn_cls()
         # This provides the pseudo-word-embedding, but not the positional embedding
-        self.text_conv = nn.Conv1d(in_channels=256, out_channels=self.ngram_embedding_size, kernel_size=self.kernel_size, padding='same')
-        self.text_deconv = nn.ConvTranspose1d(in_channels=self.ngram_embedding_size, out_channels=256, stride=self.kernel_size, kernel_size=self.kernel_size)
-        self.pos_embedding = nn.Embedding(num_embeddings=self.input_size//self.kernel_size, embedding_dim=self.ngram_embedding_size)
+        self.pos_embedding = nn.Embedding(num_embeddings=self.input_size, embedding_dim=self.embed_size)
         self.dropout = nn.Dropout(embedding_dropout)
+        self.layer_norm = nn.LayerNorm(self.embed_size)
         # Missing: Layer norm(n_embed).
 
         self.blocks = nn.ModuleList(
@@ -135,18 +128,18 @@ class C2GPT(nn.Module):
             # batch size, sequence length, embedding dimensionality (n_embd)
             MixedMemoryBlock(
                 activation_fn_cls=self.activation_fn_cls,
-                embedding_dims=self.ngram_embedding_size,
+                sequence_length=self.input_size,
+                embedding_dims=self.embed_size,
                 attention_heads=num_heads,
                 attention_dropout=attention_dropout,
                 residual_dropout=residual_dropout,
-                block_size=self.input_size // self.kernel_size
             ) for _ in range(num_layers)
         )
         # If we keep the intermediates, we end up with  [num_layers, batch_size, seq_len, embed_dim]
         #
         #self.final_conv = nn.Conv2d(in_channels=)
 
-        self.lm_head = nn.Linear(self.ngram_embedding_size, 256, bias=False)
+        self.lm_head = nn.Linear(self.embed_size, 256, bias=False)
 
         # init all weights, and apply a special scaled init to the residual projections, per GPT-2 paper
         self.apply(self._init_weights)
@@ -219,28 +212,22 @@ class C2GPT(nn.Module):
         # idx is a 2D array of size [batch_size, seq_len (block_size * kernel_size)], but they're longs (chars).
         device = idx.device
         batch_size, idx_block_length = idx.size()
-        assert idx_block_length <= self.input_size, f"Cannot forward sequence of length {idx_block_length}, block size is only {self.block_length}"
+        assert idx_block_length <= self.input_size, f"Cannot forward sequence of length {idx_block_length}, block size is only {self.input_size}"
 
         # forward the GPT model itself
-        embeddings = nn.functional.one_hot(idx, num_classes=256).transpose(1, 2) * 1.0  # Output pre transposition: (batch_size, idx_block_size, n_embed_dims), after: batch, dims, len/block
+        embeddings = nn.functional.one_hot(idx, num_classes=256) * 1.0  # Output: (batch_size, idx_block_size, n_embed_dims)
         # Multiply by 1.0 to hack an autocast to float or double or whatever.
-        # Both the reduction (maxpool) and conv expect [batch_size, channels, length] but we have [batch, length, channels]
-        tok_conv = self.text_conv(embeddings).transpose(1, 2)  # Transpose for [b, len, channels]
-        print(f"tok_emb shape: {tok_conv.shape}")
 
         # Generate positional encoding for the example:
-        pos = torch.arange(0, tok_conv.size(1), dtype=torch.long, device=device).unsqueeze(0)  # shape (1, idx_block_size)
+        pos = torch.arange(0, idx_block_length, dtype=torch.long, device=device).unsqueeze(0)  # shape (1, idx_block_size)
         pos_emb = self.pos_embedding(pos)  # position embeddings of shape (1, idx_block_size, n_embd)
-        print(f"pos_emb shape: {pos_emb.shape}")
-        x = self.dropout(tok_conv + pos_emb)
+        x = self.dropout(embeddings + pos_emb)
         for block in self.blocks:
-            print(f"x shape: {x.shape}")
             x = block(x)
-        #x = self.transformer.ln_f(x) # Normalization removed!
-        lm_out = self.lm_head(x)
-        print(f"lm out shape: {lm_out.shape}")
-        logits = self.text_deconv(lm_out.transpose(1, 2)).transpose(1, 2)
-        print(logits.shape)
+        x = self.layer_norm(x)
+        #deconv_out = self.text_deconv(x.transpose(1, 2)).transpose(1, 2)
+        #print(f"deconv out shape: {deconv_out.shape}")
+        logits = self.lm_head(x) #self.lm_head(deconv_out)
 
         # if we are given some desired targets also calculate the loss
         loss = None
@@ -258,7 +245,7 @@ class C2GPT(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.block_length else idx[:, -self.block_length:]
+            idx_cond = idx if idx.size(1) <= self.input_size else idx[:, -self.input_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
