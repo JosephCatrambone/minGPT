@@ -106,13 +106,20 @@ class C2GPT(nn.Module):
             input_sequence_length: int = 4096,
             num_layers: int = 24,
             num_heads: int = 8,
+            embedding_size: int = -1,
             embedding_dropout: float = 0.1,
             attention_dropout: float = 0.1,
             residual_dropout: float = 0.1,
     ):
         super().__init__()
         self.input_size = input_sequence_length
-        self.embed_size = 256  # Same as char size.
+        if embedding_size <= 256:
+            print("Using character-level embedding because embedding-dim was less than 256.")
+            self.embed_size = 256  # Same as char size.
+            self.char_embedding = None
+        else:
+            self.embed_size = embedding_size
+            self.char_embedding = nn.Embedding(num_embeddings=self.input_size, embedding_dim=self.embed_size)
         #
         self.activation_fn_cls = nn.SELU
         self.activation = self.activation_fn_cls()
@@ -215,7 +222,10 @@ class C2GPT(nn.Module):
         assert idx_block_length <= self.input_size, f"Cannot forward sequence of length {idx_block_length}, block size is only {self.input_size}"
 
         # forward the GPT model itself
-        embeddings = nn.functional.one_hot(idx, num_classes=256) * 1.0  # Output: (batch_size, idx_block_size, n_embed_dims)
+        if self.char_embedding is None:
+            embeddings = nn.functional.one_hot(idx, num_classes=256) * 1.0  # Output: (batch_size, idx_block_size, n_embed_dims)
+        else:
+            embeddings = self.char_embedding(idx)
         # Multiply by 1.0 to hack an autocast to float or double or whatever.
 
         # Generate positional encoding for the example:

@@ -15,6 +15,11 @@ from mingpt.model import GPT, C2GPT
 from mingpt.trainer import Trainer
 from mingpt.utils import set_seed, setup_logging, CfgNode as CN
 
+# Logging and configs:
+try:
+    import wandb
+except ImportError:
+    wandb = None
 # -----------------------------------------------------------------------------
 
 
@@ -37,7 +42,7 @@ def get_config():
 
     # trainer
     C.trainer = Trainer.get_default_config()
-    C.trainer.learning_rate = 5e-6 # the model we're using is so small that we can go a bit faster
+    C.trainer.learning_rate = 5e-5 # the model we're using is so small that we can go a bit faster
 
     return C
 
@@ -87,6 +92,30 @@ class CharDataset(Dataset):
         return x, y
 
 
+class ByteDataset(Dataset):
+    def __init__(self, filename: str, sequence_length: int):
+        with open(filename, 'rb') as fin:
+            self.data = fin.read()
+        self.sequence_length = sequence_length
+        self.input_length = len(self.data)
+
+    @staticmethod
+    def get_vocab_size():
+        return 256
+
+    def get_block_size(self):
+        return self.sequence_length
+
+    def __len__(self):
+        return self.input_length - self.get_block_size() - 1
+
+    def __getitem__(self, idx):
+        chunk = self.data[idx:idx + self.sequence_length + 1]
+        x = torch.tensor([c for c in chunk[:-1]], dtype=torch.long)
+        y = torch.tensor([c for c in chunk[1:]], dtype=torch.long)
+        return x, y
+
+
 class ByteStreamDataset(Dataset):
     """
     Emits batches of bytes.
@@ -131,21 +160,41 @@ if __name__ == '__main__':
     set_seed(config.system.seed)
 
     sequence_length = 512
+    num_layers = 32
+    num_heads = 16
+    embedding_size = 1024
 
     # construct the training dataset
-    tin = open(sys.argv[1], 'rb')
-    train_dataset = ByteStreamDataset(tin, sequence_length=sequence_length)
+    #tin = open(sys.argv[1], 'rb')
+    #train_dataset = ByteStreamDataset(tin, sequence_length=sequence_length)
+    train_dataset = ByteDataset(sys.argv[1], sequence_length=sequence_length)
 
     # construct the model
     model = C2GPT(
         input_sequence_length=sequence_length,
-        num_layers=64,
-        num_heads=32,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        embedding_size=embedding_size,
     )
 
     # construct the trainer object
     trainer = Trainer(config.trainer, model, train_dataset)
     record = open(f"training_record_{int(time.time())}.txt", 'wt')
+
+    # Update W&B logs:
+    if wandb:
+        wandb.init(
+            project="chargpt",
+            config={
+                "learning_rate": config.trainer.learning_rate,
+                "num_layers": num_layers,
+                "num_heads": num_heads,
+                "embedding_size": embedding_size,
+                "sequence_length": sequence_length,
+                "batch_size": config.trainer.batch_size,
+                "dataset": sys.argv[1]
+            }
+        )
 
     # iteration callback
     def batch_end_callback(trainer):
@@ -153,7 +202,10 @@ if __name__ == '__main__':
         if trainer.iter_num % 10 == 0:
             print(f"iter_dt {trainer.iter_dt * 1000:.2f}ms; iter {trainer.iter_num}: train loss {trainer.loss.item():.5f}")
 
-        if trainer.iter_num % 100 == 0:
+        if trainer.iter_num % 100 == 0 and wandb:
+            wandb.log({"loss": trainer.loss.item()})
+
+        if trainer.iter_num % 500 == 0:
             # evaluate both the train and test score
             model.eval()
             with torch.no_grad():
@@ -168,6 +220,9 @@ if __name__ == '__main__':
                 print(completion)
                 record.write(f"iter {trainer.iter_num} - loss {trainer.loss.item():.8f} - '{context}{completion}'\n")
                 record.flush()
+                if wandb:
+                    wandb.log({"loss": trainer.loss.item(), "sample": wandb.Table(data=[[f"{completion}"]], columns=["Text"])})
+                
             # save the latest model
             print("saving model")
             ckpt_path = os.path.join(config.system.work_dir, "model.pt")
